@@ -1,6 +1,6 @@
 {
  "id": "{USERNAME}/sdxl-convert-phase25-tpu",
- "title": "SDXL Convert Phase2-5 TPU",
+ "title": "SDXL Convert Phase25 TPU",
  "code_file": "notebook.ipynb",
  "language": "python",
  "kernel_type": "notebook",

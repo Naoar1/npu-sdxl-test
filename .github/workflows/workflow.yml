@@ -95,7 +95,7 @@ jobs:
         if: inputs.skip_phase1 == 'false'
         run: |
           cd kaggle/notebook_a_gpu
-          kaggle kernels push -p .
+          kaggle kernels push -p . --accelerator NvidiaTeslaT4
 
       - name: Poll notebook A until complete
         if: inputs.skip_phase1 == 'false'

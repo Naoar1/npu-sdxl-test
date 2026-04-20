@@ -1,0 +1,192 @@
+name: NPU SDXL Conversion via Kaggle
+
+concurrency:
+  group: sdxl-convert-kaggle
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      civitai_version_id:
+        description: "Civitai modelVersionId (SDXL model)"
+        required: true
+        default: "1408658"
+        type: string
+      model_name:
+        description: "Output zip prefix"
+        required: true
+        default: "customxl"
+        type: string
+      realistic:
+        description: "Realistic calibration prompts (SDXL Base / photoreal)"
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      skip_phase1:
+        description: "Skip Phase 1 GPU kernel (reuse existing Kaggle kernel output)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+env:
+  KERNEL_A_SLUG: sdxl-convert-phase1-gpu
+  KERNEL_B_SLUG: sdxl-convert-phase25-tpu
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kaggle CLI
+        run: |
+          pip install --quiet kaggle
+
+      - name: Configure Kaggle API
+        env:
+          KAGGLE_JSON: ${{ secrets.KAGGLE_JSON }}
+        run: |
+          if [ -z "$KAGGLE_JSON" ]; then
+            echo "::error ::KAGGLE_JSON secret is missing"
+            exit 1
+          fi
+          mkdir -p ~/.kaggle
+          printf '%s' "$KAGGLE_JSON" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+          KAGGLE_USERNAME=$(python -c "import json; print(json.load(open('$HOME/.kaggle/kaggle.json'))['username'])")
+          echo "::add-mask::$KAGGLE_USERNAME"
+          echo "KAGGLE_USERNAME=$KAGGLE_USERNAME" >> $GITHUB_ENV
+          kaggle --version
+
+      - name: Patch notebook A metadata and source
+        if: inputs.skip_phase1 == 'false'
+        env:
+          CIVITAI_API_KEY: ${{ secrets.CIVITAI_API_KEY }}
+        run: |
+          if [ -z "$CIVITAI_API_KEY" ]; then
+            echo "::error ::CIVITAI_API_KEY secret is missing"
+            exit 1
+          fi
+          cd kaggle/notebook_a_gpu
+          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g" kernel-metadata.json
+          python <<'PYEOF'
+          import json, os
+          nb = json.load(open('notebook.ipynb'))
+          subs = {
+              '__CIVITAI_VERSION_ID__': '${{ inputs.civitai_version_id }}',
+              '__MODEL_NAME__':         '${{ inputs.model_name }}',
+              '__REALISTIC__':          '${{ inputs.realistic }}',
+              '__CIVITAI_API_KEY__':    os.environ['CIVITAI_API_KEY'],
+          }
+          for c in nb['cells']:
+              if c['cell_type'] != 'code': continue
+              src = ''.join(c['source']) if isinstance(c['source'], list) else c['source']
+              for k, v in subs.items():
+                  src = src.replace(k, v)
+              c['source'] = src.splitlines(keepends=True)
+          json.dump(nb, open('notebook.ipynb','w'), indent=1, ensure_ascii=False)
+          print('Notebook A patched')
+          PYEOF
+
+      - name: Push notebook A (GPU Phase 1)
+        if: inputs.skip_phase1 == 'false'
+        run: |
+          cd kaggle/notebook_a_gpu
+          kaggle kernels push -p .
+
+      - name: Poll notebook A until complete
+        if: inputs.skip_phase1 == 'false'
+        timeout-minutes: 120
+        run: |
+          for i in $(seq 1 240); do
+            sleep 30
+            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$KERNEL_A_SLUG 2>&1 || true)
+            echo "[A $i/240] RAW: $OUT"
+            S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancelAcknowledged|cancelRequested|queued|failed)' | head -1 | tr '[:upper:]' '[:lower:]')
+            echo "[A $i/240] parsed=$S"
+            case "$S" in
+              complete|success) echo "Notebook A done"; exit 0 ;;
+              error|cancelacknowledged|cancelrequested|failed)
+                echo "Notebook A failed"
+                mkdir -p /tmp/a_out
+                kaggle kernels output $KAGGLE_USERNAME/$KERNEL_A_SLUG -p /tmp/a_out || true
+                ls -la /tmp/a_out || true
+                exit 1 ;;
+            esac
+          done
+          echo "Timed out waiting for notebook A"
+          exit 1
+
+      - name: Patch notebook B metadata and source
+        env:
+          CIVITAI_API_KEY: ${{ secrets.CIVITAI_API_KEY }}
+        run: |
+          if [ -z "$CIVITAI_API_KEY" ]; then
+            echo "::error ::CIVITAI_API_KEY secret is missing"
+            exit 1
+          fi
+          cd kaggle/notebook_b_tpu
+          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g" kernel-metadata.json
+          python <<'PYEOF'
+          import json, os
+          nb = json.load(open('notebook.ipynb'))
+          subs = {
+              '__CIVITAI_VERSION_ID__': '${{ inputs.civitai_version_id }}',
+              '__MODEL_NAME__':         '${{ inputs.model_name }}',
+              '__REALISTIC__':          '${{ inputs.realistic }}',
+              '__CIVITAI_API_KEY__':    os.environ['CIVITAI_API_KEY'],
+          }
+          for c in nb['cells']:
+              if c['cell_type'] != 'code': continue
+              src = ''.join(c['source']) if isinstance(c['source'], list) else c['source']
+              for k, v in subs.items():
+                  src = src.replace(k, v)
+              c['source'] = src.splitlines(keepends=True)
+          json.dump(nb, open('notebook.ipynb','w'), indent=1, ensure_ascii=False)
+          print('Notebook B patched')
+          PYEOF
+
+      - name: Push notebook B (TPU Phase 2-5)
+        run: |
+          cd kaggle/notebook_b_tpu
+          kaggle kernels push -p .
+
+      - name: Poll notebook B until complete
+        timeout-minutes: 240
+        run: |
+          for i in $(seq 1 480); do
+            sleep 30
+            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$KERNEL_B_SLUG 2>&1 || true)
+            echo "[B $i/480] RAW: $OUT"
+            S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancelAcknowledged|cancelRequested|queued|failed)' | head -1 | tr '[:upper:]' '[:lower:]')
+            echo "[B $i/480] parsed=$S"
+            case "$S" in
+              complete|success) echo "Notebook B done"; exit 0 ;;
+              error|cancelacknowledged|cancelrequested|failed)
+                echo "Notebook B failed"
+                mkdir -p /tmp/b_out
+                kaggle kernels output $KAGGLE_USERNAME/$KERNEL_B_SLUG -p /tmp/b_out || true
+                ls -la /tmp/b_out || true
+                exit 1 ;;
+            esac
+          done
+          echo "Timed out waiting for notebook B"
+          exit 1
+
+      - name: Download notebook B output
+        if: always()
+        run: |
+          mkdir -p output
+          kaggle kernels output $KAGGLE_USERNAME/$KERNEL_B_SLUG -p output/ || true
+          ls -la output/
+
+      - name: Upload GH artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdxl-output-${{ inputs.model_name }}-${{ github.run_id }}
+          path: output/
+          if-no-files-found: warn

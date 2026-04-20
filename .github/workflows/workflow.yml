@@ -105,11 +105,11 @@ jobs:
             sleep 30
             OUT=$(kaggle kernels status $KAGGLE_USERNAME/$KERNEL_A_SLUG 2>&1 || true)
             echo "[A $i/240] RAW: $OUT"
-            S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancelAcknowledged|cancelRequested|queued|failed)' | head -1 | tr '[:upper:]' '[:lower:]')
+            S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancel_acknowledged|cancel_requested|queued|new_script)' | head -1 | tr '[:upper:]' '[:lower:]')
             echo "[A $i/240] parsed=$S"
             case "$S" in
-              complete|success) echo "Notebook A done"; exit 0 ;;
-              error|cancelacknowledged|cancelrequested|failed)
+              complete) echo "Notebook A done"; exit 0 ;;
+              error|cancel_acknowledged|cancel_requested)
                 echo "Notebook A failed"
                 mkdir -p /tmp/a_out
                 kaggle kernels output $KAGGLE_USERNAME/$KERNEL_A_SLUG -p /tmp/a_out || true
@@ -161,11 +161,11 @@ jobs:
             sleep 30
             OUT=$(kaggle kernels status $KAGGLE_USERNAME/$KERNEL_B_SLUG 2>&1 || true)
             echo "[B $i/480] RAW: $OUT"
-            S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancelAcknowledged|cancelRequested|queued|failed)' | head -1 | tr '[:upper:]' '[:lower:]')
+            S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancel_acknowledged|cancel_requested|queued|new_script)' | head -1 | tr '[:upper:]' '[:lower:]')
             echo "[B $i/480] parsed=$S"
             case "$S" in
-              complete|success) echo "Notebook B done"; exit 0 ;;
-              error|cancelacknowledged|cancelrequested|failed)
+              complete) echo "Notebook B done"; exit 0 ;;
+              error|cancel_acknowledged|cancel_requested)
                 echo "Notebook B failed"
                 mkdir -p /tmp/b_out
                 kaggle kernels output $KAGGLE_USERNAME/$KERNEL_B_SLUG -p /tmp/b_out || true

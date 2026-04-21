@@ -13,7 +13,7 @@ on:
         default: "1408658"
         type: string
       model_name:
-        description: "Output zip prefix"
+        description: "Output zip prefix + naming slug segment (alphanumeric + dashes only)"
         required: true
         default: "customxl"
         type: string
@@ -24,15 +24,16 @@ on:
         type: choice
         options: ["false", "true"]
       skip_phase1:
-        description: "Skip Phase 1 GPU kernel (reuse existing Kaggle kernel output)"
+        description: "Skip Phase 1 GPU kernel (reuse existing Kaggle Phase 1 kernel)"
         required: false
         default: "false"
         type: choice
         options: ["false", "true"]
-
-env:
-  KERNEL_A_SLUG: sdxl-convert-phase1-gpu
-  KERNEL_B_SLUG: sdxl-convert-phase25-tpu
+      phase1_slug:
+        description: "Existing Phase 1 kernel slug to reuse when skip_phase1=true (e.g. sdxl-convert-phase1-gpu-customxl-20260421-033000)"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   orchestrate:
@@ -61,6 +62,42 @@ jobs:
           echo "KAGGLE_USERNAME=$KAGGLE_USERNAME" >> $GITHUB_ENV
           kaggle --version
 
+      - name: Compute kernel slugs with model_name + timestamp
+        id: slugs
+        run: |
+          set -e
+          # sanitize model_name: lowercase, allow only [a-z0-9-], collapse dashes
+          NAME=$(echo "${{ inputs.model_name }}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\+/-/g; s/^-\|-$//g')
+          if [ -z "$NAME" ]; then
+            echo "::error ::model_name sanitized to empty"
+            exit 1
+          fi
+          TS=$(date -u +%Y%m%d-%H%M%S)
+          SLUG_B="sdxl-convert-phase25-tpu-${NAME}-${TS}"
+
+          if [ "${{ inputs.skip_phase1 }}" = "true" ]; then
+            if [ -z "${{ inputs.phase1_slug }}" ]; then
+              echo "::error ::skip_phase1=true requires phase1_slug input (existing A kernel slug)"
+              exit 1
+            fi
+            SLUG_A="${{ inputs.phase1_slug }}"
+            # Verify referenced A kernel exists and is complete
+            STAT=$(kaggle kernels status "$KAGGLE_USERNAME/$SLUG_A" 2>&1 || true)
+            echo "$STAT"
+            if ! echo "$STAT" | grep -qi 'complete'; then
+              echo "::error ::referenced phase1_slug not found or not complete: $SLUG_A"
+              exit 1
+            fi
+          else
+            SLUG_A="sdxl-convert-phase1-gpu-${NAME}-${TS}"
+          fi
+
+          echo "SLUG_A=$SLUG_A" | tee -a $GITHUB_ENV
+          echo "SLUG_B=$SLUG_B" | tee -a $GITHUB_ENV
+          # titles must slugify to match id
+          echo "TITLE_A=$SLUG_A" | tee -a $GITHUB_ENV
+          echo "TITLE_B=$SLUG_B" | tee -a $GITHUB_ENV
+
       - name: Patch notebook A metadata and source
         if: inputs.skip_phase1 == 'false'
         env:
@@ -71,7 +108,7 @@ jobs:
             exit 1
           fi
           cd kaggle/notebook_a_gpu
-          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g" kernel-metadata.json
+          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g; s|{SLUG_A}|$SLUG_A|g; s|{TITLE_A}|$TITLE_A|g" kernel-metadata.json
           python <<'PYEOF'
           import json, os
           nb = json.load(open('notebook.ipynb'))
@@ -103,7 +140,7 @@ jobs:
         run: |
           for i in $(seq 1 240); do
             sleep 30
-            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$KERNEL_A_SLUG 2>&1 || true)
+            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$SLUG_A 2>&1 || true)
             echo "[A $i/240] RAW: $OUT"
             S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancel_acknowledged|cancel_requested|queued|new_script)' | head -1 | tr '[:upper:]' '[:lower:]')
             echo "[A $i/240] parsed=$S"
@@ -112,7 +149,7 @@ jobs:
               error|cancel_acknowledged|cancel_requested)
                 echo "Notebook A failed"
                 mkdir -p /tmp/a_out
-                kaggle kernels output $KAGGLE_USERNAME/$KERNEL_A_SLUG -p /tmp/a_out || true
+                kaggle kernels output $KAGGLE_USERNAME/$SLUG_A -p /tmp/a_out || true
                 ls -la /tmp/a_out || true
                 exit 1 ;;
             esac
@@ -121,23 +158,16 @@ jobs:
           exit 1
 
       - name: Patch notebook B metadata and source
-        env:
-          CIVITAI_API_KEY: ${{ secrets.CIVITAI_API_KEY }}
         run: |
-          if [ -z "$CIVITAI_API_KEY" ]; then
-            echo "::error ::CIVITAI_API_KEY secret is missing"
-            exit 1
-          fi
           cd kaggle/notebook_b_tpu
-          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g" kernel-metadata.json
+          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g; s|{SLUG_A}|$SLUG_A|g; s|{SLUG_B}|$SLUG_B|g; s|{TITLE_B}|$TITLE_B|g" kernel-metadata.json
           python <<'PYEOF'
-          import json, os
+          import json
           nb = json.load(open('notebook.ipynb'))
           subs = {
               '__CIVITAI_VERSION_ID__': '${{ inputs.civitai_version_id }}',
               '__MODEL_NAME__':         '${{ inputs.model_name }}',
               '__REALISTIC__':          '${{ inputs.realistic }}',
-              '__CIVITAI_API_KEY__':    os.environ['CIVITAI_API_KEY'],
           }
           for c in nb['cells']:
               if c['cell_type'] != 'code': continue
@@ -159,7 +189,7 @@ jobs:
         run: |
           for i in $(seq 1 480); do
             sleep 30
-            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$KERNEL_B_SLUG 2>&1 || true)
+            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$SLUG_B 2>&1 || true)
             echo "[B $i/480] RAW: $OUT"
             S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancel_acknowledged|cancel_requested|queued|new_script)' | head -1 | tr '[:upper:]' '[:lower:]')
             echo "[B $i/480] parsed=$S"
@@ -168,7 +198,7 @@ jobs:
               error|cancel_acknowledged|cancel_requested)
                 echo "Notebook B failed"
                 mkdir -p /tmp/b_out
-                kaggle kernels output $KAGGLE_USERNAME/$KERNEL_B_SLUG -p /tmp/b_out || true
+                kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p /tmp/b_out || true
                 ls -la /tmp/b_out || true
                 exit 1 ;;
             esac
@@ -180,7 +210,7 @@ jobs:
         if: always()
         run: |
           mkdir -p output
-          kaggle kernels output $KAGGLE_USERNAME/$KERNEL_B_SLUG -p output/ || true
+          kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p output/ || true
           ls -la output/
 
       - name: Upload GH artifact

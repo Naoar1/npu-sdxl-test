@@ -1,7 +1,9 @@
 name: NPU SDXL Conversion via Kaggle
 
 concurrency:
-  group: sdxl-convert-kaggle
+  # Per-model group: different model_name runs can go in parallel.
+  # Same model_name will still cancel-in-progress to avoid duplicate TPU quota burn.
+  group: sdxl-convert-kaggle-${{ inputs.model_name }}
   cancel-in-progress: true
 
 on:
@@ -23,6 +25,12 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      min_soc:
+        description: "Target Snapdragon SoC. Upstream convertsdxl.zip currently ships 8gen3 config only (as of 2026-04-20)."
+        required: true
+        default: "8gen3"
+        type: choice
+        options: ["8gen3", "8gen4"]
       skip_phase1:
         description: "Skip Phase 1 GPU kernel (reuse existing Kaggle Phase 1 kernel)"
         required: false
@@ -30,7 +38,7 @@ on:
         type: choice
         options: ["false", "true"]
       phase1_slug:
-        description: "Existing Phase 1 kernel slug to reuse when skip_phase1=true (e.g. sdxl-convert-phase1-gpu-customxl-20260421-033000)"
+        description: "Phase 1 kernel slug (ONLY when skip_phase1=true; leave blank otherwise). e.g. sdxl-convert-phase1-gpu OR sdxl-convert-phase1-gpu-customxl-20260421-033000"
         required: false
         default: ""
         type: string
@@ -168,6 +176,7 @@ jobs:
               '__CIVITAI_VERSION_ID__': '${{ inputs.civitai_version_id }}',
               '__MODEL_NAME__':         '${{ inputs.model_name }}',
               '__REALISTIC__':          '${{ inputs.realistic }}',
+              '__MIN_SOC__':            '${{ inputs.min_soc }}',
           }
           for c in nb['cells']:
               if c['cell_type'] != 'code': continue

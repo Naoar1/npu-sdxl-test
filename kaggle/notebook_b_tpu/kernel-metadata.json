@@ -1,6 +1,6 @@
 {
- "id": "{USERNAME}/sdxl-convert-phase25-tpu",
- "title": "SDXL Convert Phase25 TPU",
+ "id": "{USERNAME}/{SLUG_B}",
+ "title": "{TITLE_B}",
  "code_file": "notebook.ipynb",
  "language": "python",
  "kernel_type": "notebook",
@@ -9,6 +9,6 @@
  "enable_tpu": true,
  "enable_internet": true,
  "dataset_sources": [],
- "kernel_sources": ["{USERNAME}/sdxl-convert-phase1-gpu"],
+ "kernel_sources": ["{USERNAME}/{SLUG_A}"],
  "competition_sources": []
 }

@@ -1,6 +1,6 @@
 {
- "id": "{USERNAME}/sdxl-convert-phase1-gpu",
- "title": "SDXL Convert Phase1 GPU",
+ "id": "{USERNAME}/{SLUG_A}",
+ "title": "{TITLE_A}",
  "code_file": "notebook.ipynb",
  "language": "python",
  "kernel_type": "notebook",

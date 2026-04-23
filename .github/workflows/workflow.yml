@@ -1,8 +1,6 @@
 name: NPU SDXL Conversion via Kaggle
 
 concurrency:
-  # Per-model group: different model_name runs can go in parallel.
-  # Same model_name will still cancel-in-progress to avoid duplicate TPU quota burn.
   group: sdxl-convert-kaggle-${{ inputs.model_name }}
   cancel-in-progress: true
 
@@ -31,31 +29,14 @@ on:
         default: "8gen3"
         type: choice
         options: ["8gen3", "8gen4"]
-      burn_tpu:
-        description: "Run TPU heartbeat (continuous tiny CNN training in main kernel thread). Required for B2 (>2h); optional for B1 (~1h48m)."
-        required: true
-        default: "true"
-        type: choice
-        options: ["true", "false"]
       skip_phase1:
-        description: "Skip Phase 1 GPU kernel (reuse existing A kernel)"
+        description: "Skip Phase 1 GPU kernel (reuse existing Kaggle Phase 1 kernel)"
         required: false
         default: "false"
         type: choice
         options: ["false", "true"]
       phase1_slug:
-        description: "Phase 1 kernel slug (ONLY when skip_phase1=true; leave blank otherwise)"
-        required: false
-        default: ""
-        type: string
-      skip_b1:
-        description: "Skip B1 (CLIP+VAE+UNet-converter); only run B2. Requires b1_slug."
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
-      b1_slug:
-        description: "B1 kernel slug (ONLY when skip_b1=true). e.g. sdxl-convert-b1-tpu-customxl-20260421-120000"
+        description: "Phase 1 kernel slug (ONLY when skip_phase1=true; leave blank otherwise)."
         required: false
         default: ""
         type: string
@@ -63,7 +44,6 @@ on:
 jobs:
   orchestrate:
     runs-on: ubuntu-latest
-    # GHA free tier hard caps at 360 min. One run = either (A+B1) or (B2 alone), not all three.
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
@@ -88,60 +68,48 @@ jobs:
           echo "KAGGLE_USERNAME=$KAGGLE_USERNAME" >> $GITHUB_ENV
           kaggle --version
 
-      - name: Compute kernel slugs (A / B1 / B2) with model_name + timestamp
+      - name: Compute kernel slugs with model_name + timestamp
+        id: slugs
         run: |
           set -e
           NAME=$(echo "${{ inputs.model_name }}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\+/-/g; s/^-\|-$//g')
-          if [ -z "$NAME" ]; then echo "::error ::model_name sanitized to empty"; exit 1; fi
+          if [ -z "$NAME" ]; then
+            echo "::error ::model_name sanitized to empty"
+            exit 1
+          fi
           TS=$(date -u +%Y%m%d-%H%M%S)
+          SLUG_B="sdxl-convert-phase25-tpu-${NAME}-${TS}"
 
-          # A slug
           if [ "${{ inputs.skip_phase1 }}" = "true" ]; then
             if [ -z "${{ inputs.phase1_slug }}" ]; then
-              echo "::error ::skip_phase1=true requires phase1_slug input"; exit 1
+              echo "::error ::skip_phase1=true requires phase1_slug input"
+              exit 1
             fi
             SLUG_A="${{ inputs.phase1_slug }}"
             STAT=$(kaggle kernels status "$KAGGLE_USERNAME/$SLUG_A" 2>&1 || true)
             echo "$STAT"
             if ! echo "$STAT" | grep -qi 'complete'; then
-              echo "::error ::phase1_slug not complete: $SLUG_A"; exit 1
+              echo "::error ::referenced phase1_slug not found or not complete: $SLUG_A"
+              exit 1
             fi
           else
             SLUG_A="sdxl-convert-phase1-gpu-${NAME}-${TS}"
           fi
 
-          # B1 slug
-          if [ "${{ inputs.skip_b1 }}" = "true" ]; then
-            if [ -z "${{ inputs.b1_slug }}" ]; then
-              echo "::error ::skip_b1=true requires b1_slug input"; exit 1
-            fi
-            SLUG_B1="${{ inputs.b1_slug }}"
-            STAT=$(kaggle kernels status "$KAGGLE_USERNAME/$SLUG_B1" 2>&1 || true)
-            echo "$STAT"
-            if ! echo "$STAT" | grep -qi 'complete'; then
-              echo "::error ::b1_slug not complete: $SLUG_B1"; exit 1
-            fi
-          else
-            SLUG_B1="sdxl-convert-b1-tpu-${NAME}-${TS}"
-          fi
+          echo "SLUG_A=$SLUG_A" | tee -a $GITHUB_ENV
+          echo "SLUG_B=$SLUG_B" | tee -a $GITHUB_ENV
+          echo "TITLE_A=$SLUG_A" | tee -a $GITHUB_ENV
+          echo "TITLE_B=$SLUG_B" | tee -a $GITHUB_ENV
 
-          # B2 slug (always fresh unless we add skip_b2 later)
-          SLUG_B2="sdxl-convert-b2-tpu-${NAME}-${TS}"
-
-          echo "SLUG_A=$SLUG_A"   | tee -a $GITHUB_ENV
-          echo "SLUG_B1=$SLUG_B1" | tee -a $GITHUB_ENV
-          echo "SLUG_B2=$SLUG_B2" | tee -a $GITHUB_ENV
-          echo "TITLE_A=$SLUG_A"   | tee -a $GITHUB_ENV
-          echo "TITLE_B1=$SLUG_B1" | tee -a $GITHUB_ENV
-          echo "TITLE_B2=$SLUG_B2" | tee -a $GITHUB_ENV
-
-      # ========== A (Phase 1) ==========
-      - name: Patch notebook A
+      - name: Patch notebook A metadata and source
         if: inputs.skip_phase1 == 'false'
         env:
           CIVITAI_API_KEY: ${{ secrets.CIVITAI_API_KEY }}
         run: |
-          if [ -z "$CIVITAI_API_KEY" ]; then echo "::error ::CIVITAI_API_KEY missing"; exit 1; fi
+          if [ -z "$CIVITAI_API_KEY" ]; then
+            echo "::error ::CIVITAI_API_KEY secret is missing"
+            exit 1
+          fi
           cd kaggle/notebook_a_gpu
           sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g; s|{SLUG_A}|$SLUG_A|g; s|{TITLE_A}|$TITLE_A|g" kernel-metadata.json
           python <<'PYEOF'
@@ -156,136 +124,103 @@ jobs:
           for c in nb['cells']:
               if c['cell_type'] != 'code': continue
               src = ''.join(c['source']) if isinstance(c['source'], list) else c['source']
-              for k, v in subs.items(): src = src.replace(k, v)
+              for k, v in subs.items():
+                  src = src.replace(k, v)
               c['source'] = src.splitlines(keepends=True)
           json.dump(nb, open('notebook.ipynb','w'), indent=1, ensure_ascii=False)
+          print('Notebook A patched')
           PYEOF
 
-      - name: Push notebook A (Phase 1)
+      - name: Push notebook A (GPU Phase 1)
         if: inputs.skip_phase1 == 'false'
         run: |
-          cd kaggle/notebook_a_gpu && kaggle kernels push -p . --accelerator NvidiaTeslaT4
+          cd kaggle/notebook_a_gpu
+          kaggle kernels push -p . --accelerator NvidiaTeslaT4
 
-      - name: Poll notebook A
+      - name: Poll notebook A until complete
         if: inputs.skip_phase1 == 'false'
         timeout-minutes: 60
         run: |
           for i in $(seq 1 120); do
             sleep 30
             OUT=$(kaggle kernels status $KAGGLE_USERNAME/$SLUG_A 2>&1 || true)
-            echo "[A $i/120] $OUT"
+            echo "[A $i/120] RAW: $OUT"
             S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancel_acknowledged|cancel_requested|queued|new_script)' | head -1 | tr '[:upper:]' '[:lower:]')
+            echo "[A $i/120] parsed=$S"
             case "$S" in
-              complete) echo "A done"; exit 0 ;;
+              complete) echo "Notebook A done"; exit 0 ;;
               error|cancel_acknowledged|cancel_requested)
-                mkdir -p /tmp/a_out && kaggle kernels output $KAGGLE_USERNAME/$SLUG_A -p /tmp/a_out || true
-                echo "A failed"; exit 1 ;;
+                echo "Notebook A failed"
+                mkdir -p /tmp/a_out
+                kaggle kernels output $KAGGLE_USERNAME/$SLUG_A -p /tmp/a_out || true
+                ls -la /tmp/a_out || true
+                exit 1 ;;
             esac
           done
-          echo "A timeout"; exit 1
+          echo "Timed out waiting for notebook A"
+          exit 1
 
-      # ========== B1 (CLIP + VAE + UNet converter, ~2h) ==========
-      - name: Patch notebook B1
-        if: inputs.skip_b1 == 'false'
+      - name: Patch notebook B metadata and source
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          cd kaggle/notebook_b1_tpu
-          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g; s|{SLUG_A}|$SLUG_A|g; s|{SLUG_B1}|$SLUG_B1|g; s|{TITLE_B1}|$TITLE_B1|g" kernel-metadata.json
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::warning ::HF_TOKEN secret is missing — TPU burner will fail to download gated Llama-3.2-1B"
+          fi
+          cd kaggle/notebook_b_tpu
+          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g; s|{SLUG_A}|$SLUG_A|g; s|{SLUG_B}|$SLUG_B|g; s|{TITLE_B}|$TITLE_B|g" kernel-metadata.json
           python <<'PYEOF'
-          import json
+          import json, os
           nb = json.load(open('notebook.ipynb'))
           subs = {
               '__CIVITAI_VERSION_ID__': '${{ inputs.civitai_version_id }}',
               '__MODEL_NAME__':         '${{ inputs.model_name }}',
               '__REALISTIC__':          '${{ inputs.realistic }}',
               '__MIN_SOC__':            '${{ inputs.min_soc }}',
-              '__BURN_TPU__':           '${{ inputs.burn_tpu }}',
+              '__HF_TOKEN__':           os.environ.get('HF_TOKEN', ''),
           }
           for c in nb['cells']:
               if c['cell_type'] != 'code': continue
               src = ''.join(c['source']) if isinstance(c['source'], list) else c['source']
-              for k, v in subs.items(): src = src.replace(k, v)
+              for k, v in subs.items():
+                  src = src.replace(k, v)
               c['source'] = src.splitlines(keepends=True)
           json.dump(nb, open('notebook.ipynb','w'), indent=1, ensure_ascii=False)
+          print('Notebook B patched')
           PYEOF
 
-      - name: Push notebook B1 (Phase 2-4a on TPU)
-        if: inputs.skip_b1 == 'false'
+      - name: Push notebook B (TPU Phase 2-5)
         run: |
-          cd kaggle/notebook_b1_tpu && kaggle kernels push -p .
+          cd kaggle/notebook_b_tpu
+          kaggle kernels push -p .
 
-      - name: Poll notebook B1
-        if: inputs.skip_b1 == 'false'
-        # B1 empirical upper bound: ~2h (1h48m + margin). 145 min gives ~22 min headroom.
-        timeout-minutes: 145
-        run: |
-          for i in $(seq 1 290); do
-            sleep 30
-            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$SLUG_B1 2>&1 || true)
-            echo "[B1 $i/290] $OUT"
-            S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancel_acknowledged|cancel_requested|queued|new_script)' | head -1 | tr '[:upper:]' '[:lower:]')
-            case "$S" in
-              complete) echo "B1 done"; exit 0 ;;
-              error|cancel_acknowledged|cancel_requested)
-                mkdir -p /tmp/b1_out && kaggle kernels output $KAGGLE_USERNAME/$SLUG_B1 -p /tmp/b1_out || true
-                echo "B1 failed"; exit 1 ;;
-            esac
-          done
-          echo "B1 timeout"; exit 1
-
-      # ========== B2 (UNet quantizer + context-bin + package, ~5h) ==========
-      # NOTE: B2's full ~5h compute + setup may exceed GHA's 360min job cap when combined with A+B1.
-      # Recommended usage: run once with skip_b1=false (A+B1), then second workflow run with
-      # skip_phase1=true skip_b1=true and both slugs to execute ONLY B2 within its own GHA budget.
-      - name: Patch notebook B2
-        run: |
-          cd kaggle/notebook_b2_tpu
-          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g; s|{SLUG_B1}|$SLUG_B1|g; s|{SLUG_B2}|$SLUG_B2|g; s|{TITLE_B2}|$TITLE_B2|g" kernel-metadata.json
-          python <<'PYEOF'
-          import json
-          nb = json.load(open('notebook.ipynb'))
-          subs = {
-              '__CIVITAI_VERSION_ID__': '${{ inputs.civitai_version_id }}',
-              '__MODEL_NAME__':         '${{ inputs.model_name }}',
-              '__REALISTIC__':          '${{ inputs.realistic }}',
-              '__MIN_SOC__':            '${{ inputs.min_soc }}',
-              '__BURN_TPU__':           '${{ inputs.burn_tpu }}',
-          }
-          for c in nb['cells']:
-              if c['cell_type'] != 'code': continue
-              src = ''.join(c['source']) if isinstance(c['source'], list) else c['source']
-              for k, v in subs.items(): src = src.replace(k, v)
-              c['source'] = src.splitlines(keepends=True)
-          json.dump(nb, open('notebook.ipynb','w'), indent=1, ensure_ascii=False)
-          PYEOF
-
-      - name: Push notebook B2 (UNet quantizer + context-bin + package)
-        run: |
-          cd kaggle/notebook_b2_tpu && kaggle kernels push -p .
-
-      - name: Poll notebook B2
-        # GHA job-wide cap is 360min. When running A+B1+B2 in one trigger, B2 polling budget is
-        # limited by remaining time. Polling may time out while Kaggle kernel continues.
+      - name: Poll notebook B until complete
         timeout-minutes: 340
         run: |
           for i in $(seq 1 680); do
             sleep 30
-            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$SLUG_B2 2>&1 || true)
-            echo "[B2 $i/680] $OUT"
+            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$SLUG_B 2>&1 || true)
+            echo "[B $i/680] RAW: $OUT"
             S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancel_acknowledged|cancel_requested|queued|new_script)' | head -1 | tr '[:upper:]' '[:lower:]')
+            echo "[B $i/680] parsed=$S"
             case "$S" in
-              complete) echo "B2 done"; exit 0 ;;
+              complete) echo "Notebook B done"; exit 0 ;;
               error|cancel_acknowledged|cancel_requested)
-                mkdir -p /tmp/b2_out && kaggle kernels output $KAGGLE_USERNAME/$SLUG_B2 -p /tmp/b2_out || true
-                echo "B2 failed"; exit 1 ;;
+                echo "Notebook B failed"
+                mkdir -p /tmp/b_out
+                kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p /tmp/b_out || true
+                ls -la /tmp/b_out || true
+                exit 1 ;;
             esac
           done
-          echo "B2 timeout"; exit 1
+          echo "Timed out waiting for notebook B"
+          exit 1
 
-      - name: Download notebook B2 output (final zip)
+      - name: Download notebook B output
         if: always()
         run: |
           mkdir -p output
-          kaggle kernels output $KAGGLE_USERNAME/$SLUG_B2 -p output/ || true
+          kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p output/ || true
           ls -la output/
 
       - name: Upload GH artifact

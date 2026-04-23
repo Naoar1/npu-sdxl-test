@@ -1,8 +1,6 @@
 name: NPU SDXL Conversion via Kaggle
 
 concurrency:
-  # Per-model group: different model_name runs can go in parallel.
-  # Same model_name will still cancel-in-progress to avoid duplicate TPU quota burn.
   group: sdxl-convert-kaggle-${{ inputs.model_name }}
   cancel-in-progress: true
 
@@ -38,7 +36,7 @@ on:
         type: choice
         options: ["false", "true"]
       phase1_slug:
-        description: "Phase 1 kernel slug (ONLY when skip_phase1=true; leave blank otherwise). e.g. sdxl-convert-phase1-gpu OR sdxl-convert-phase1-gpu-customxl-20260421-033000"
+        description: "Phase 1 kernel slug (ONLY when skip_phase1=true; leave blank otherwise)."
         required: false
         default: ""
         type: string
@@ -74,7 +72,6 @@ jobs:
         id: slugs
         run: |
           set -e
-          # sanitize model_name: lowercase, allow only [a-z0-9-], collapse dashes
           NAME=$(echo "${{ inputs.model_name }}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\+/-/g; s/^-\|-$//g')
           if [ -z "$NAME" ]; then
             echo "::error ::model_name sanitized to empty"
@@ -85,11 +82,10 @@ jobs:
 
           if [ "${{ inputs.skip_phase1 }}" = "true" ]; then
             if [ -z "${{ inputs.phase1_slug }}" ]; then
-              echo "::error ::skip_phase1=true requires phase1_slug input (existing A kernel slug)"
+              echo "::error ::skip_phase1=true requires phase1_slug input"
               exit 1
             fi
             SLUG_A="${{ inputs.phase1_slug }}"
-            # Verify referenced A kernel exists and is complete
             STAT=$(kaggle kernels status "$KAGGLE_USERNAME/$SLUG_A" 2>&1 || true)
             echo "$STAT"
             if ! echo "$STAT" | grep -qi 'complete'; then
@@ -102,7 +98,6 @@ jobs:
 
           echo "SLUG_A=$SLUG_A" | tee -a $GITHUB_ENV
           echo "SLUG_B=$SLUG_B" | tee -a $GITHUB_ENV
-          # titles must slugify to match id
           echo "TITLE_A=$SLUG_A" | tee -a $GITHUB_ENV
           echo "TITLE_B=$SLUG_B" | tee -a $GITHUB_ENV
 
@@ -144,7 +139,6 @@ jobs:
 
       - name: Poll notebook A until complete
         if: inputs.skip_phase1 == 'false'
-        # Last observed A runtime: 31 min (40 image generations on T4). 60 min gives ~2x margin.
         timeout-minutes: 60
         run: |
           for i in $(seq 1 120); do
@@ -167,17 +161,23 @@ jobs:
           exit 1
 
       - name: Patch notebook B metadata and source
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::warning ::HF_TOKEN secret is missing — TPU burner will fail to download gated Llama-3.2-1B"
+          fi
           cd kaggle/notebook_b_tpu
           sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g; s|{SLUG_A}|$SLUG_A|g; s|{SLUG_B}|$SLUG_B|g; s|{TITLE_B}|$TITLE_B|g" kernel-metadata.json
           python <<'PYEOF'
-          import json
+          import json, os
           nb = json.load(open('notebook.ipynb'))
           subs = {
               '__CIVITAI_VERSION_ID__': '${{ inputs.civitai_version_id }}',
               '__MODEL_NAME__':         '${{ inputs.model_name }}',
               '__REALISTIC__':          '${{ inputs.realistic }}',
               '__MIN_SOC__':            '${{ inputs.min_soc }}',
+              '__HF_TOKEN__':           os.environ.get('HF_TOKEN', ''),
           }
           for c in nb['cells']:
               if c['cell_type'] != 'code': continue
@@ -195,7 +195,6 @@ jobs:
           kaggle kernels push -p .
 
       - name: Poll notebook B until complete
-        # GHA hard caps job at 360 min; leave 20 min budget for download + upload steps after this.
         timeout-minutes: 340
         run: |
           for i in $(seq 1 680); do

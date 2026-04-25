@@ -210,11 +210,33 @@ jobs:
                 echo "Notebook B failed"
                 mkdir -p /tmp/b_out
                 kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p /tmp/b_out || true
-                ls -la /tmp/b_out || true
+                find /tmp/b_out -maxdepth 3 -type f -printf '%p %s bytes\n' || true
+                for f in \
+                  /tmp/b_out/logs/tpu_burner.log \
+                  /tmp/b_out/logs/tpu_watchdog.log \
+                  /tmp/b_out/logs/phase45.log \
+                  /tmp/b_out/logs/package_zip.log; do
+                  if [ -f "$f" ]; then
+                    echo "===== tail $f ====="
+                    tail -120 "$f" || true
+                  fi
+                done
                 exit 1 ;;
             esac
           done
           echo "Timed out waiting for notebook B"
+          mkdir -p /tmp/b_timeout
+          kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p /tmp/b_timeout || true
+          find /tmp/b_timeout -maxdepth 3 -type f -printf '%p %s bytes\n' || true
+          for f in \
+            /tmp/b_timeout/logs/tpu_burner.log \
+            /tmp/b_timeout/logs/tpu_watchdog.log \
+            /tmp/b_timeout/logs/phase45.log; do
+            if [ -f "$f" ]; then
+              echo "===== tail $f ====="
+              tail -120 "$f" || true
+            fi
+          done
           exit 1
 
       - name: Download notebook B output
@@ -222,7 +244,17 @@ jobs:
         run: |
           mkdir -p output
           kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p output/ || true
-          ls -la output/
+          find output -maxdepth 3 -type f -printf '%p %s bytes\n' || true
+          for f in \
+            output/logs/tpu_burner.log \
+            output/logs/tpu_watchdog.log \
+            output/logs/phase45.log \
+            output/logs/package_zip.log; do
+            if [ -f "$f" ]; then
+              echo "===== tail $f ====="
+              tail -80 "$f" || true
+            fi
+          done
 
       - name: Upload GH artifact
         if: always()

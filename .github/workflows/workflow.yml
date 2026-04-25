@@ -234,6 +234,8 @@ jobs:
                   /tmp/b_out/logs/phase45.affinity.sample.log \
                   /tmp/b_out/logs/qnn_stage.tsv \
                   /tmp/b_out/logs/qnn_current_stage.tsv \
+                  /tmp/b_out/logs/qnn_status.tsv \
+                  /tmp/b_out/logs/qnn_artifacts.tsv \
                   /tmp/b_out/logs/package_zip.log; do
                   if [ -f "$f" ]; then
                     echo "===== tail $f ====="
@@ -253,7 +255,9 @@ jobs:
             /tmp/b_timeout/logs/phase45.log \
             /tmp/b_timeout/logs/phase45.affinity.sample.log \
             /tmp/b_timeout/logs/qnn_stage.tsv \
-            /tmp/b_timeout/logs/qnn_current_stage.tsv; do
+            /tmp/b_timeout/logs/qnn_current_stage.tsv \
+            /tmp/b_timeout/logs/qnn_status.tsv \
+            /tmp/b_timeout/logs/qnn_artifacts.tsv; do
             if [ -f "$f" ]; then
               echo "===== tail $f ====="
               tail -120 "$f" || true
@@ -274,6 +278,8 @@ jobs:
             output/logs/phase45.affinity.sample.log \
             output/logs/qnn_stage.tsv \
             output/logs/qnn_current_stage.tsv \
+            output/logs/qnn_status.tsv \
+            output/logs/qnn_artifacts.tsv \
             output/logs/package_zip.log; do
             if [ -f "$f" ]; then
               echo "===== tail $f ====="

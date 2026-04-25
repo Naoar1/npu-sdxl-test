@@ -38,7 +38,7 @@ on:
         type: choice
         options: ["false", "true"]
       phase1_slug:
-        description: "Phase 1 kernel slug (ONLY when skip_phase1=true; leave blank otherwise). e.g. sdxl-convert-phase1-gpu OR sdxl-convert-phase1-gpu-customxl-20260421-033000"
+        description: "Phase 1 kernel slug or owner/slug (ONLY when skip_phase1=true; leave blank otherwise)."
         required: false
         default: ""
         type: string
@@ -88,19 +88,28 @@ jobs:
               echo "::error ::skip_phase1=true requires phase1_slug input (existing A kernel slug)"
               exit 1
             fi
-            SLUG_A="${{ inputs.phase1_slug }}"
+            INPUT_A="${{ inputs.phase1_slug }}"
+            if echo "$INPUT_A" | grep -q '/'; then
+              PHASE1_REF="$INPUT_A"
+              SLUG_A="${INPUT_A#*/}"
+            else
+              SLUG_A="$INPUT_A"
+              PHASE1_REF="$KAGGLE_USERNAME/$SLUG_A"
+            fi
             # Verify referenced A kernel exists and is complete
-            STAT=$(kaggle kernels status "$KAGGLE_USERNAME/$SLUG_A" 2>&1 || true)
+            STAT=$(kaggle kernels status "$PHASE1_REF" 2>&1 || true)
             echo "$STAT"
             if ! echo "$STAT" | grep -qi 'complete'; then
-              echo "::error ::referenced phase1_slug not found or not complete: $SLUG_A"
+              echo "::error ::referenced phase1 kernel not found or not complete: $PHASE1_REF"
               exit 1
             fi
           else
             SLUG_A="sdxl-convert-phase1-gpu-${NAME}-${TS}"
+            PHASE1_REF="$KAGGLE_USERNAME/$SLUG_A"
           fi
 
           echo "SLUG_A=$SLUG_A" | tee -a $GITHUB_ENV
+          echo "PHASE1_REF=$PHASE1_REF" | tee -a $GITHUB_ENV
           echo "SLUG_B=$SLUG_B" | tee -a $GITHUB_ENV
           # titles must slugify to match id
           echo "TITLE_A=$SLUG_A" | tee -a $GITHUB_ENV
@@ -169,7 +178,14 @@ jobs:
       - name: Patch notebook B metadata and source
         run: |
           cd kaggle/notebook_b_tpu
-          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g; s|{SLUG_A}|$SLUG_A|g; s|{SLUG_B}|$SLUG_B|g; s|{TITLE_B}|$TITLE_B|g" kernel-metadata.json
+          python <<'PYEOF'
+          import json, os
+          meta = json.load(open('kernel-metadata.json'))
+          meta['id'] = f"{os.environ['KAGGLE_USERNAME']}/{os.environ['SLUG_B']}"
+          meta['title'] = os.environ['TITLE_B']
+          meta['kernel_sources'] = [os.environ['PHASE1_REF']]
+          json.dump(meta, open('kernel-metadata.json','w'), indent=1)
+          PYEOF
           python <<'PYEOF'
           import json
           nb = json.load(open('notebook.ipynb'))

@@ -1,14 +1,14 @@
 {
- "id": "{USERNAME}/{SLUG_B1}",
- "title": "{TITLE_B1}",
+ "id": "{USERNAME}/{SLUG_B2}",
+ "title": "{TITLE_B2}",
  "code_file": "notebook.ipynb",
  "language": "python",
  "kernel_type": "notebook",
  "is_private": true,
  "enable_gpu": false,
- "enable_tpu": true,
+ "enable_tpu": false,
  "enable_internet": true,
  "dataset_sources": [],
- "kernel_sources": ["{PHASE1_REF}"],
+ "kernel_sources": ["{B1_REF}"],
  "competition_sources": []
 }

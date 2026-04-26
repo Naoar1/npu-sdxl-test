@@ -9,6 +9,6 @@
  "enable_tpu": true,
  "enable_internet": true,
  "dataset_sources": [],
- "kernel_sources": ["{USERNAME}/{SLUG_B1}"],
+ "kernel_sources": ["{B1_REF}"],
  "competition_sources": []
 }

@@ -75,36 +75,49 @@ def kaggle_status(ref):
 
 
 def list_pipeline_kernels(username):
-    out = run(
-        [
-            "kaggle",
-            "kernels",
-            "list",
-            "--mine",
-            "--search",
-            "sdxl-",
-            "--sort-by",
-            "dateRun",
-            "--page-size",
-            "200",
-            "--csv",
-        ],
-        check=False,
-        capture=True,
-    )
-    refs = []
-    for row in csv.reader(out.splitlines()):
-        for cell in row:
-            cell = cell.strip()
-            if "/" not in cell:
-                continue
-            owner, slug = cell.split("/", 1)
-            if owner == username and parse_slug(slug):
-                refs.append(cell)
+    commands = [
+        ["kaggle", "kernels", "list", "--mine", "--page-size", "200", "--csv"],
+        ["kaggle", "kernels", "list", "--mine", "--search", "sdxl", "--page-size", "200", "--csv"],
+        ["kaggle", "kernels", "list", "--user", username, "--page-size", "200", "--csv"],
+    ]
+    refs = set()
+    raw_outputs = []
+    for cmd in commands:
+        out = run(cmd, check=False, capture=True)
+        raw_outputs.append(out)
+        for row in csv.reader(out.splitlines()):
+            for cell in row:
+                cell = cell.strip().strip('"')
+                if not cell:
+                    continue
+                m = re.search(r"kaggle\.com/code/([^/\s,]+)/([^/\s,]+)", cell)
+                if m:
+                    owner, slug = m.group(1), m.group(2)
+                elif "/" in cell:
+                    owner, slug = cell.split("/", 1)
+                else:
+                    owner, slug = username, cell
+                slug = slug.split("?", 1)[0].strip()
+                if owner == username and parse_slug(slug):
+                    refs.add(f"{owner}/{slug}")
+        refs.update(
+            f"{username}/{slug}"
+            for slug in re.findall(
+                r"sdxl-(?:cpu|tpu)-(?:a|b1|b2)-[a-z0-9-]+-(?:8gen3|8gen4)-r[01]-\d{8}-\d{6}",
+                out,
+            )
+            if parse_slug(slug)
+        )
     if not refs:
-        refs = sorted(set(re.findall(rf"{re.escape(username)}/sdxl-[a-z0-9-]+", out)))
+        previews = []
+        for out in raw_outputs:
+            for line in out.splitlines()[1:8]:
+                previews.append(line[:240])
+        print("No sdxl refs parsed from Kaggle list output. Preview:")
+        for line in previews[:20]:
+            print(line)
     grouped = {}
-    for ref in refs:
+    for ref in sorted(refs):
         slug = ref.split("/", 1)[1]
         info = parse_slug(slug)
         if not info:

@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT.parent
-SLUG_RE = re.compile(r"^sdxl-(a|b1|b2)-(.+)-(8gen3|8gen4)-(r[01])-(\d{8}-\d{6})$")
+SLUG_RE = re.compile(r"^sdxl-(cpu|tpu)-(a|b1|b2)-(.+)-(8gen3|8gen4)-(r[01])-(\d{8}-\d{6})$")
 
 
 def run(cmd, check=True, cwd=None, capture=False, env=None):
@@ -40,13 +40,13 @@ def bool_slug(value):
     return "r1" if str(value).lower() == "true" else "r0"
 
 
-def pipeline_slugs(model, soc, realistic, stamp=None):
+def pipeline_slugs(model, soc, realistic, stamp=None, runtime="tpu"):
     stamp = stamp or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     base = f"{sanitize_model(model)}-{soc}-{bool_slug(realistic)}-{stamp}"
     return {
-        "a": f"sdxl-a-{base}",
-        "b1": f"sdxl-b1-{base}",
-        "b2": f"sdxl-b2-{base}",
+        "a": f"sdxl-{runtime}-a-{base}",
+        "b1": f"sdxl-{runtime}-b1-{base}",
+        "b2": f"sdxl-{runtime}-b2-{base}",
         "stamp": stamp,
     }
 
@@ -55,14 +55,15 @@ def parse_slug(slug):
     m = SLUG_RE.match(slug)
     if not m:
         return None
-    stage, model, soc, real, stamp = m.groups()
+    runtime, stage, model, soc, real, stamp = m.groups()
     return {
-            "stage": stage,
-            "model": model,
-            "soc": soc,
-            "realistic": "true" if real == "r1" else "false",
+        "runtime": runtime,
+        "stage": stage,
+        "model": model,
+        "soc": soc,
+        "realistic": "true" if real == "r1" else "false",
         "stamp": stamp,
-        "key": (model, soc, real, stamp),
+        "key": (runtime, model, soc, real, stamp),
     }
 
 
@@ -154,7 +155,8 @@ def prepare_a(work_root, username, slug, title, inputs):
 
 
 def prepare_b(work_root, stage, username, slug, source_ref, inputs):
-    src = ROOT / ("notebook_b1_tpu" if stage == "b1" else "notebook_b2_tpu")
+    runtime = inputs.get("runtime", "tpu")
+    src = ROOT / f"notebook_{stage}_{runtime}"
     dst = work_root / src.name
     reset_dir_from_repo(src, dst)
     meta = json.load(open(dst / "kernel-metadata.json", encoding="utf-8"))
@@ -222,8 +224,9 @@ def newest_pipeline(grouped):
 
 
 def inputs_from_key(key):
-    model, soc, real, _stamp = key
+    runtime, model, soc, real, _stamp = key
     return {
+        "runtime": runtime,
         "model_name": model,
         "min_soc": soc,
         "realistic": "true" if real == "r1" else "false",
@@ -232,7 +235,9 @@ def inputs_from_key(key):
 
 
 def start(username, inputs):
-    slugs = pipeline_slugs(inputs["model_name"], inputs["min_soc"], inputs["realistic"])
+    slugs = pipeline_slugs(
+        inputs["model_name"], inputs["min_soc"], inputs["realistic"], runtime=inputs.get("runtime", "tpu")
+    )
     work_root = REPO / ".kaggle_work" / slugs["stamp"]
     work_root.mkdir(parents=True, exist_ok=True)
     if inputs["skip_phase1"] == "true":
@@ -258,8 +263,8 @@ def watch(username):
         print("No sdxl pipeline kernels found")
         return
     inputs = inputs_from_key(key)
-    model, soc, real, stamp = key
-    print(f"Watching pipeline model={model} soc={soc} realistic={real} stamp={stamp} refs={refs}")
+    runtime, model, soc, real, stamp = key
+    print(f"Watching pipeline runtime={runtime} model={model} soc={soc} realistic={real} stamp={stamp} refs={refs}")
     work_root = REPO / ".kaggle_work" / stamp
     work_root.mkdir(parents=True, exist_ok=True)
 
@@ -282,9 +287,9 @@ def watch(username):
         out = REPO / "output" / refs["b1"].split("/", 1)[1]
         if state == "complete":
             output_to(refs["b1"], out, diagnostics_only=True)
-            folder = prepare_b(work_root, "b2", username, f"sdxl-b2-{model}-{soc}-{real}-{stamp}", refs["b1"], inputs)
+            folder = prepare_b(work_root, "b2", username, f"sdxl-{runtime}-b2-{model}-{soc}-{real}-{stamp}", refs["b1"], inputs)
             push_kernel(folder)
-            print(f"STARTED_B2={username}/sdxl-b2-{model}-{soc}-{real}-{stamp}")
+            print(f"STARTED_B2={username}/sdxl-{runtime}-b2-{model}-{soc}-{real}-{stamp}")
         elif state in {"error", "cancel_acknowledged", "cancel_requested"}:
             output_to(refs["b1"], out)
             raise SystemExit(f"B1 failed state={state}")
@@ -296,9 +301,9 @@ def watch(username):
     if "a" in refs:
         state = kaggle_status(refs["a"])
         if state == "complete":
-            folder = prepare_b(work_root, "b1", username, f"sdxl-b1-{model}-{soc}-{real}-{stamp}", refs["a"], inputs)
+            folder = prepare_b(work_root, "b1", username, f"sdxl-{runtime}-b1-{model}-{soc}-{real}-{stamp}", refs["a"], inputs)
             push_kernel(folder)
-            print(f"STARTED_B1={username}/sdxl-b1-{model}-{soc}-{real}-{stamp}")
+            print(f"STARTED_B1={username}/sdxl-{runtime}-b1-{model}-{soc}-{real}-{stamp}")
         elif state in {"error", "cancel_acknowledged", "cancel_requested"}:
             out = REPO / "output" / refs["a"].split("/", 1)[1]
             output_to(refs["a"], out)
@@ -316,6 +321,7 @@ def main():
     if action == "start":
         inputs = {
             "civitai_version_id": os.environ.get("CIVITAI_VERSION_ID", "2883731"),
+            "runtime": os.environ.get("RUNTIME_MODE", "tpu"),
             "model_name": os.environ.get("MODEL_NAME", "customxl"),
             "realistic": os.environ.get("REALISTIC", "false"),
             "min_soc": os.environ.get("MIN_SOC", "8gen3"),

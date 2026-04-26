@@ -35,10 +35,16 @@ on:
         default: "8gen3"
         type: choice
         options: ["8gen3", "8gen4"]
+      runtime_mode:
+        description: "Kaggle runtime for B1/B2 conversion stages"
+        required: true
+        default: "cpu"
+        type: choice
+        options: ["cpu", "tpu"]
       skip_phase1:
         description: "Skip Phase 1 GPU kernel and reuse an existing Phase 1 output"
         required: false
-        default: "true"
+        default: "false"
         type: choice
         options: ["false", "true"]
       phase1_slug:
@@ -88,7 +94,8 @@ jobs:
           MODEL_NAME: ${{ inputs.model_name || vars.SDXL_MODEL_NAME || 'customxl' }}
           REALISTIC: ${{ inputs.realistic || vars.SDXL_REALISTIC || 'false' }}
           MIN_SOC: ${{ inputs.min_soc || vars.SDXL_MIN_SOC || '8gen3' }}
-          SKIP_PHASE1: ${{ inputs.skip_phase1 || vars.SDXL_SKIP_PHASE1 || 'true' }}
+          RUNTIME_MODE: ${{ inputs.runtime_mode || vars.SDXL_RUNTIME_MODE || 'cpu' }}
+          SKIP_PHASE1: ${{ inputs.skip_phase1 || vars.SDXL_SKIP_PHASE1 || 'false' }}
           PHASE1_SLUG: ${{ inputs.phase1_slug || vars.SDXL_PHASE1_SLUG || '' }}
           CIVITAI_API_KEY: ${{ secrets.CIVITAI_API_KEY }}
         run: |

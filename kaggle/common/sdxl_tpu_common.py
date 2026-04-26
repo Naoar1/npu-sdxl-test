@@ -148,7 +148,7 @@ def copy_phase1_calibration_data():
     assert os.listdir(dst_img), f"{dst_img} empty"
 
 
-def start_background_services():
+def start_mem_watcher():
     os.makedirs(LOG_DIR, exist_ok=True)
     watcher_sh = """#!/bin/bash
 echo "epoch,datetime,MemAvail_MB,TopRSS_MB,TopProc"
@@ -171,6 +171,15 @@ done
     )
     open("/tmp/watcher.pid", "w").write(str(p.pid))
     print(f"[*] {now_hms()} mem-watcher pid={p.pid}")
+
+
+def start_background_services(use_tpu_burner=True):
+    start_mem_watcher()
+    if not use_tpu_burner:
+        os.environ["USE_TPU_BURNER"] = "false"
+        print(f"[*] {now_hms()} TPU burner disabled for CPU-only Kaggle session")
+        return
+    os.environ["USE_TPU_BURNER"] = "true"
 
     print(f"[*] {now_hms()} installing tensorflow-tpu runtime")
     run('export PATH="${HOME}/.local/bin:${PATH}" && uv pip uninstall --system jax 2>&1 | tail -3', check=False)
@@ -523,6 +532,9 @@ class QnnSupervisor:
         self.exec_start = 0
         self.exec_end = 0
         self.last_status_exec_end = 0
+        self.progress_stage = None
+        self.stage_exec_start_base = 0
+        self.stage_exec_end_base = 0
         self.stage_input_cache = {}
         for p in [self.phase_log, self.affinity_log, self.stage_tsv, self.current_stage_file]:
             open(p, "w").close()
@@ -532,8 +544,8 @@ class QnnSupervisor:
         )
         open(self.artifact_tsv, "w").write("epoch\tts\tstage\tout_files\tout_mib\tkey_files\n")
         open(self.progress_tsv, "w").write(
-            "epoch\tts\tstage\tstage_age_s\tinput_list\tinput_rows\texec_start\texec_end\t"
-            "exec_delta_per_min\tpass_est\tlast_qnn_ms\n"
+            "epoch\tts\tstage\tstage_age_s\tinput_list\tinput_rows\tstage_exec_start\tstage_exec_end\t"
+            "exec_delta_per_min\tpass_est\tapprox_pass\tapprox_row\tlast_qnn_ms\n"
         )
 
     def dropped_count(self, line):
@@ -547,6 +559,12 @@ class QnnSupervisor:
 
     def handle_line(self, line, logf, afff):
         clean = line.rstrip()
+        marker = re.search(r"\[\[QNN_STAGE\]\].*\bevent=(\S+)\s+stage=(\S+)", clean)
+        if marker and marker.group(1) == "start":
+            self.progress_stage = marker.group(2)
+            self.stage_exec_start_base = self.exec_start
+            self.stage_exec_end_base = self.exec_end
+            self.last_status_exec_end = self.exec_end
         if "[QNN_CPU] QnnGraph execute start" in clean:
             self.exec_start += 1
         if "[QNN_CPU] QnnGraph execute end" in clean:
@@ -568,6 +586,8 @@ class QnnSupervisor:
             self.printed_lines += 1
 
     def tpu_status(self):
+        if os.environ.get("USE_TPU_BURNER", "true").lower() == "false":
+            return "disabled"
         ok = f"{LOG_DIR}/tpu_burner.ok"
         if not os.path.exists(ok):
             return "missing"
@@ -628,6 +648,8 @@ class QnnSupervisor:
         return "; ".join(rows[:4]) if rows else "none"
 
     def burner_proc_stats(self):
+        if os.environ.get("USE_TPU_BURNER", "true").lower() == "false":
+            return "disabled"
         try:
             out = subprocess.check_output(["ps", "-eo", "pid,etimes,pcpu,rss,comm,args"], text=True)
         except Exception:
@@ -681,12 +703,21 @@ class QnnSupervisor:
         self.stage_input_cache[path] = (raw, rows)
         return raw, rows
 
-    def progress_record(self, stage_status, stage_age, cmd, now, last_affinity_time):
+    def progress_record(self, stage_name, stage_status, stage_age, cmd, now, last_affinity_time):
+        if stage_name != self.progress_stage:
+            self.progress_stage = stage_name
+            self.stage_exec_start_base = self.exec_start
+            self.stage_exec_end_base = self.exec_end
+            self.last_status_exec_end = self.exec_end
         input_list, rows = self.input_list_summary(stage_status, cmd)
+        stage_exec_start = self.exec_start - self.stage_exec_start_base
+        stage_exec_end = self.exec_end - self.stage_exec_end_base
         exec_delta = self.exec_end - self.last_status_exec_end
         self.last_status_exec_end = self.exec_end
         exec_rate = 60.0 * exec_delta / max(1.0, now - last_affinity_time)
-        pass_est = (self.exec_end / rows) if rows else 0.0
+        pass_est = (stage_exec_end / rows) if rows else 0.0
+        approx_pass = int(stage_exec_end // rows) if rows else 0
+        approx_row = int(stage_exec_end % rows) if rows else 0
         last_ms = ""
         m = re.search(r"([0-9.]+)ms", self.last_milestone)
         if m:
@@ -703,17 +734,23 @@ class QnnSupervisor:
                             int(stage_age or 0),
                             input_list,
                             rows,
-                            self.exec_start,
-                            self.exec_end,
+                            stage_exec_start,
+                            stage_exec_end,
                             f"{exec_rate:.2f}",
                             f"{pass_est:.3f}",
+                            approx_pass,
+                            approx_row,
                             last_ms,
                         ],
                     )
                 )
                 + "\n"
             )
-        return f"input_rows={rows} exec={self.exec_end}/{self.exec_start} pass_est={pass_est:.2f} exec_rate={exec_rate:.1f}/min"
+        return (
+            f"input_rows={rows} stage_exec={stage_exec_end}/{stage_exec_start} "
+            f"pass_est={pass_est:.2f} approx_pass={approx_pass} approx_row={approx_row} "
+            f"exec_rate={exec_rate:.1f}/min"
+        )
 
     def run(self, command, required_outputs=None):
         os.environ["QNN_STAGE_TSV"] = self.stage_tsv
@@ -750,13 +787,13 @@ class QnnSupervisor:
                     break
                 now = time.time()
                 if now - last_status >= 60:
-                    stage_status, _stage_event, _stage_name, stage_age, cmd = self.current_stage()
+                    stage_status, _stage_event, stage_name, stage_age, cmd = self.current_stage()
                     proc_status = self.qnn_proc_stats()
                     phase_mib = file_mib(self.phase_log)
                     affinity_rate = 60.0 * (self.suppressed_affinity - last_affinity_count) / max(
                         1.0, now - last_affinity_time
                     )
-                    progress = self.progress_record(stage_status, stage_age, cmd, now, last_affinity_time)
+                    progress = self.progress_record(stage_name, stage_status, stage_age, cmd, now, last_affinity_time)
                     last_affinity_count = self.suppressed_affinity
                     last_affinity_time = now
                     files, out_mib, key_files = self.artifact_summary()
@@ -1006,17 +1043,17 @@ def stop_background_services():
             continue
 
 
-def common_bootstrap(model_name, min_soc, realistic, civitai_version_id=None):
+def common_bootstrap(model_name, min_soc, realistic, civitai_version_id=None, use_tpu_burner=True):
     configure_env(model_name, min_soc, realistic, civitai_version_id)
     run("free -h", check=False)
     install_tools_and_convert_package()
     install_qnn_sdk()
     setup_python_env()
-    start_background_services()
+    start_background_services(use_tpu_burner=use_tpu_burner)
 
 
-def run_b1(model_name, min_soc, realistic, civitai_version_id=None):
-    common_bootstrap(model_name, min_soc, realistic, civitai_version_id)
+def run_b1(model_name, min_soc, realistic, civitai_version_id=None, use_tpu_burner=True):
+    common_bootstrap(model_name, min_soc, realistic, civitai_version_id, use_tpu_burner=use_tpu_burner)
     locate_phase1_output()
     copy_phase1_calibration_data()
     run_phase2()
@@ -1044,8 +1081,8 @@ def run_b1(model_name, min_soc, realistic, civitai_version_id=None):
     print(f"[*] {now_hms()} B1 done")
 
 
-def run_b2(model_name, min_soc, realistic, civitai_version_id=None):
-    common_bootstrap(model_name, min_soc, realistic, civitai_version_id)
+def run_b2(model_name, min_soc, realistic, civitai_version_id=None, use_tpu_burner=True):
+    common_bootstrap(model_name, min_soc, realistic, civitai_version_id, use_tpu_burner=use_tpu_burner)
     restore_b1_bundle_to_npu()
     patch_convert_scripts()
     prepare_qnn_runtime()

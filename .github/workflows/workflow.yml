@@ -1,56 +1,63 @@
 name: NPU SDXL Conversion via Kaggle
 
 concurrency:
-  # Per-model group: different model_name runs can go in parallel.
-  # Same model_name will still cancel-in-progress to avoid duplicate TPU quota burn.
-  group: sdxl-convert-kaggle-${{ inputs.model_name }}
-  cancel-in-progress: true
+  group: sdxl-convert-kaggle-${{ inputs.model_name || 'scheduled-watch' }}
+  cancel-in-progress: false
 
 on:
   workflow_dispatch:
     inputs:
+      pipeline_action:
+        description: "start pushes the next Kaggle notebook; watch checks current Kaggle state and advances if ready"
+        required: true
+        default: "start"
+        type: choice
+        options: ["start", "watch"]
       civitai_version_id:
         description: "Civitai modelVersionId (SDXL model)"
         required: true
-        default: "1408658"
+        default: "2883731"
         type: string
       model_name:
-        description: "Output zip prefix + naming slug segment (alphanumeric + dashes only)"
+        description: "Output zip prefix + slug segment"
         required: true
         default: "customxl"
         type: string
       realistic:
-        description: "Realistic calibration prompts (SDXL Base / photoreal)"
+        description: "Realistic calibration prompts"
         required: true
         default: "false"
         type: choice
         options: ["false", "true"]
       min_soc:
-        description: "Target Snapdragon SoC. Upstream convertsdxl.zip currently ships 8gen3 config only (as of 2026-04-20)."
+        description: "Target Snapdragon SoC"
         required: true
         default: "8gen3"
         type: choice
         options: ["8gen3", "8gen4"]
       skip_phase1:
-        description: "Skip Phase 1 GPU kernel (reuse existing Kaggle Phase 1 kernel)"
+        description: "Skip Phase 1 GPU kernel and reuse an existing Phase 1 output"
         required: false
-        default: "false"
+        default: "true"
         type: choice
         options: ["false", "true"]
       phase1_slug:
-        description: "Phase 1 kernel slug or owner/slug (ONLY when skip_phase1=true; leave blank otherwise)."
+        description: "Existing Phase 1 kernel slug or owner/slug when skip_phase1=true"
         required: false
         default: ""
         type: string
+  schedule:
+    # Short self-wake watcher. GitHub may delay/drop scheduled events, so every run is idempotent.
+    - cron: "*/30 * * * *"
 
 jobs:
-  orchestrate:
+  kaggle-state-machine:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install kaggle CLI
+      - name: Install Kaggle CLI
         run: |
           pip install --quiet kaggle
 
@@ -67,230 +74,32 @@ jobs:
           chmod 600 ~/.kaggle/kaggle.json
           KAGGLE_USERNAME=$(python -c "import json; print(json.load(open('$HOME/.kaggle/kaggle.json'))['username'])")
           echo "::add-mask::$KAGGLE_USERNAME"
-          echo "KAGGLE_USERNAME=$KAGGLE_USERNAME" >> $GITHUB_ENV
+          echo "KAGGLE_USERNAME=$KAGGLE_USERNAME" >> "$GITHUB_ENV"
           kaggle --version
 
-      - name: Compute kernel slugs with model_name + timestamp
-        id: slugs
+      - name: Regenerate B1/B2 notebooks from shared source
         run: |
-          set -e
-          # sanitize model_name: lowercase, allow only [a-z0-9-], collapse dashes
-          NAME=$(echo "${{ inputs.model_name }}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\+/-/g; s/^-\|-$//g')
-          if [ -z "$NAME" ]; then
-            echo "::error ::model_name sanitized to empty"
-            exit 1
-          fi
-          TS=$(date -u +%Y%m%d-%H%M%S)
-          SLUG_B="sdxl-convert-phase25-tpu-${NAME}-${TS}"
+          python kaggle/common/make_phase_notebooks.py
 
-          if [ "${{ inputs.skip_phase1 }}" = "true" ]; then
-            if [ -z "${{ inputs.phase1_slug }}" ]; then
-              echo "::error ::skip_phase1=true requires phase1_slug input (existing A kernel slug)"
-              exit 1
-            fi
-            INPUT_A="${{ inputs.phase1_slug }}"
-            if echo "$INPUT_A" | grep -q '/'; then
-              PHASE1_REF="$INPUT_A"
-              SLUG_A="${INPUT_A#*/}"
-            else
-              SLUG_A="$INPUT_A"
-              PHASE1_REF="$KAGGLE_USERNAME/$SLUG_A"
-            fi
-            # Verify referenced A kernel exists and is complete
-            STAT=$(kaggle kernels status "$PHASE1_REF" 2>&1 || true)
-            echo "$STAT"
-            if ! echo "$STAT" | grep -qi 'complete'; then
-              echo "::error ::referenced phase1 kernel not found or not complete: $PHASE1_REF"
-              exit 1
-            fi
-          else
-            SLUG_A="sdxl-convert-phase1-gpu-${NAME}-${TS}"
-            PHASE1_REF="$KAGGLE_USERNAME/$SLUG_A"
-          fi
-
-          echo "SLUG_A=$SLUG_A" | tee -a $GITHUB_ENV
-          echo "PHASE1_REF=$PHASE1_REF" | tee -a $GITHUB_ENV
-          echo "SLUG_B=$SLUG_B" | tee -a $GITHUB_ENV
-          # titles must slugify to match id
-          echo "TITLE_A=$SLUG_A" | tee -a $GITHUB_ENV
-          echo "TITLE_B=$SLUG_B" | tee -a $GITHUB_ENV
-
-      - name: Patch notebook A metadata and source
-        if: inputs.skip_phase1 == 'false'
+      - name: Run Kaggle pipeline state machine
         env:
+          PIPELINE_ACTION: ${{ github.event_name == 'schedule' && 'watch' || inputs.pipeline_action }}
+          CIVITAI_VERSION_ID: ${{ inputs.civitai_version_id || vars.SDXL_CIVITAI_VERSION_ID || '2883731' }}
+          MODEL_NAME: ${{ inputs.model_name || vars.SDXL_MODEL_NAME || 'customxl' }}
+          REALISTIC: ${{ inputs.realistic || vars.SDXL_REALISTIC || 'false' }}
+          MIN_SOC: ${{ inputs.min_soc || vars.SDXL_MIN_SOC || '8gen3' }}
+          SKIP_PHASE1: ${{ inputs.skip_phase1 || vars.SDXL_SKIP_PHASE1 || 'true' }}
+          PHASE1_SLUG: ${{ inputs.phase1_slug || vars.SDXL_PHASE1_SLUG || '' }}
           CIVITAI_API_KEY: ${{ secrets.CIVITAI_API_KEY }}
         run: |
-          if [ -z "$CIVITAI_API_KEY" ]; then
-            echo "::error ::CIVITAI_API_KEY secret is missing"
-            exit 1
-          fi
-          cd kaggle/notebook_a_gpu
-          sed -i "s|{USERNAME}|$KAGGLE_USERNAME|g; s|{SLUG_A}|$SLUG_A|g; s|{TITLE_A}|$TITLE_A|g" kernel-metadata.json
-          python <<'PYEOF'
-          import json, os
-          nb = json.load(open('notebook.ipynb'))
-          subs = {
-              '__CIVITAI_VERSION_ID__': '${{ inputs.civitai_version_id }}',
-              '__MODEL_NAME__':         '${{ inputs.model_name }}',
-              '__REALISTIC__':          '${{ inputs.realistic }}',
-              '__CIVITAI_API_KEY__':    os.environ['CIVITAI_API_KEY'],
-          }
-          for c in nb['cells']:
-              if c['cell_type'] != 'code': continue
-              src = ''.join(c['source']) if isinstance(c['source'], list) else c['source']
-              for k, v in subs.items():
-                  src = src.replace(k, v)
-              c['source'] = src.splitlines(keepends=True)
-          json.dump(nb, open('notebook.ipynb','w'), indent=1, ensure_ascii=False)
-          print('Notebook A patched')
-          PYEOF
+          python kaggle/tools/orchestrate_kaggle.py
 
-      - name: Push notebook A (GPU Phase 1)
-        if: inputs.skip_phase1 == 'false'
-        run: |
-          cd kaggle/notebook_a_gpu
-          kaggle kernels push -p . --accelerator NvidiaTeslaT4
-
-      - name: Poll notebook A until complete
-        if: inputs.skip_phase1 == 'false'
-        # Last observed A runtime: 31 min (40 image generations on T4). 60 min gives ~2x margin.
-        timeout-minutes: 60
-        run: |
-          for i in $(seq 1 120); do
-            sleep 30
-            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$SLUG_A 2>&1 || true)
-            echo "[A $i/120] RAW: $OUT"
-            S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancel_acknowledged|cancel_requested|queued|new_script)' | head -1 | tr '[:upper:]' '[:lower:]')
-            echo "[A $i/120] parsed=$S"
-            case "$S" in
-              complete) echo "Notebook A done"; exit 0 ;;
-              error|cancel_acknowledged|cancel_requested)
-                echo "Notebook A failed"
-                mkdir -p /tmp/a_out
-                kaggle kernels output $KAGGLE_USERNAME/$SLUG_A -p /tmp/a_out || true
-                ls -la /tmp/a_out || true
-                exit 1 ;;
-            esac
-          done
-          echo "Timed out waiting for notebook A"
-          exit 1
-
-      - name: Patch notebook B metadata and source
-        run: |
-          cd kaggle/notebook_b_tpu
-          python <<'PYEOF'
-          import json, os
-          meta = json.load(open('kernel-metadata.json'))
-          meta['id'] = f"{os.environ['KAGGLE_USERNAME']}/{os.environ['SLUG_B']}"
-          meta['title'] = os.environ['TITLE_B']
-          meta['kernel_sources'] = [os.environ['PHASE1_REF']]
-          json.dump(meta, open('kernel-metadata.json','w'), indent=1)
-          PYEOF
-          python <<'PYEOF'
-          import json
-          nb = json.load(open('notebook.ipynb'))
-          subs = {
-              '__CIVITAI_VERSION_ID__': '${{ inputs.civitai_version_id }}',
-              '__MODEL_NAME__':         '${{ inputs.model_name }}',
-              '__REALISTIC__':          '${{ inputs.realistic }}',
-              '__MIN_SOC__':            '${{ inputs.min_soc }}',
-          }
-          for c in nb['cells']:
-              if c['cell_type'] != 'code': continue
-              src = ''.join(c['source']) if isinstance(c['source'], list) else c['source']
-              for k, v in subs.items():
-                  src = src.replace(k, v)
-              c['source'] = src.splitlines(keepends=True)
-          json.dump(nb, open('notebook.ipynb','w'), indent=1, ensure_ascii=False)
-          print('Notebook B patched')
-          PYEOF
-
-      - name: Push notebook B (TPU Phase 2-5)
-        run: |
-          cd kaggle/notebook_b_tpu
-          kaggle kernels push -p .
-
-      - name: Poll notebook B until complete
-        # GHA hard caps job at 360 min; leave 20 min budget for download + upload steps after this.
-        timeout-minutes: 340
-        run: |
-          for i in $(seq 1 680); do
-            sleep 30
-            OUT=$(kaggle kernels status $KAGGLE_USERNAME/$SLUG_B 2>&1 || true)
-            echo "[B $i/680] RAW: $OUT"
-            S=$(echo "$OUT" | grep -oiE '(complete|running|error|cancel_acknowledged|cancel_requested|queued|new_script)' | head -1 | tr '[:upper:]' '[:lower:]')
-            echo "[B $i/680] parsed=$S"
-            case "$S" in
-              complete) echo "Notebook B done"; exit 0 ;;
-              error|cancel_acknowledged|cancel_requested)
-                echo "Notebook B failed"
-                mkdir -p /tmp/b_out
-                kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p /tmp/b_out || true
-                find /tmp/b_out -maxdepth 3 -type f -printf '%p %s bytes\n' || true
-                for f in \
-                  /tmp/b_out/logs/tpu_burner.log \
-                  /tmp/b_out/logs/tpu_watchdog.log \
-                  /tmp/b_out/logs/phase45.log \
-                  /tmp/b_out/logs/phase45.affinity.sample.log \
-                  /tmp/b_out/logs/qnn_stage.tsv \
-                  /tmp/b_out/logs/qnn_current_stage.tsv \
-                  /tmp/b_out/logs/qnn_status.tsv \
-                  /tmp/b_out/logs/qnn_artifacts.tsv \
-                  /tmp/b_out/logs/package_zip.log; do
-                  if [ -f "$f" ]; then
-                    echo "===== tail $f ====="
-                    tail -120 "$f" || true
-                  fi
-                done
-                exit 1 ;;
-            esac
-          done
-          echo "Timed out waiting for notebook B"
-          mkdir -p /tmp/b_timeout
-          kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p /tmp/b_timeout || true
-          find /tmp/b_timeout -maxdepth 3 -type f -printf '%p %s bytes\n' || true
-          for f in \
-            /tmp/b_timeout/logs/tpu_burner.log \
-            /tmp/b_timeout/logs/tpu_watchdog.log \
-            /tmp/b_timeout/logs/phase45.log \
-            /tmp/b_timeout/logs/phase45.affinity.sample.log \
-            /tmp/b_timeout/logs/qnn_stage.tsv \
-            /tmp/b_timeout/logs/qnn_current_stage.tsv \
-            /tmp/b_timeout/logs/qnn_status.tsv \
-            /tmp/b_timeout/logs/qnn_artifacts.tsv; do
-            if [ -f "$f" ]; then
-              echo "===== tail $f ====="
-              tail -120 "$f" || true
-            fi
-          done
-          exit 1
-
-      - name: Download notebook B output
-        if: always()
-        run: |
-          mkdir -p output
-          kaggle kernels output $KAGGLE_USERNAME/$SLUG_B -p output/ || true
-          find output -maxdepth 3 -type f -printf '%p %s bytes\n' || true
-          for f in \
-            output/logs/tpu_burner.log \
-            output/logs/tpu_watchdog.log \
-            output/logs/phase45.log \
-            output/logs/phase45.affinity.sample.log \
-            output/logs/qnn_stage.tsv \
-            output/logs/qnn_current_stage.tsv \
-            output/logs/qnn_status.tsv \
-            output/logs/qnn_artifacts.tsv \
-            output/logs/package_zip.log; do
-            if [ -f "$f" ]; then
-              echo "===== tail $f ====="
-              tail -80 "$f" || true
-            fi
-          done
-
-      - name: Upload GH artifact
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sdxl-output-${{ inputs.model_name }}-${{ github.run_id }}
-          path: output/
-          if-no-files-found: warn
+          name: sdxl-kaggle-diagnostics-${{ github.run_id }}
+          path: |
+            output/
+            .kaggle_work/
+          if-no-files-found: ignore

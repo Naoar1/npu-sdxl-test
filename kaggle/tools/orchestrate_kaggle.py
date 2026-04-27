@@ -235,6 +235,30 @@ def handle_kaggle_error(stage, ref, state, out):
     print(f"{msg}; FAIL_ON_KAGGLE_ERROR=false so watcher exits without failing")
 
 
+def require_b1_bundle_ready(out):
+    manifests = list(out.rglob("b1_bundle/manifest.json"))
+    if not manifests:
+        raise RuntimeError("B1 output is complete but b1_bundle/manifest.json is missing")
+    manifest_path = manifests[0]
+    bundle = manifest_path.parent
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    required = [
+        "unet_sdxl/model.onnx",
+        "input_list_unet_sdxl.txt",
+        "output",
+    ]
+    missing = [rel for rel in required if not (bundle / rel).exists()]
+    if missing:
+        raise RuntimeError("B1 bundle is incomplete; missing: " + ", ".join(missing))
+    unet_files = manifest.get("unet_sdxl_files", [])
+    if "unet_sdxl/model.onnx" not in unet_files:
+        raise RuntimeError("B1 bundle manifest is from an old/incomplete notebook: unet_sdxl_files missing")
+    missing_unet = [rel for rel in unet_files[:200] if not (bundle / rel).exists()]
+    if missing_unet:
+        raise RuntimeError("B1 bundle unet_sdxl files missing from output: " + ", ".join(missing_unet[:20]))
+    print(f"B1 bundle ready manifest={manifest_path} unet_files={len(unet_files)}")
+
+
 def print_tree(root):
     for p in sorted(root.rglob("*")):
         if p.is_file():
@@ -311,6 +335,13 @@ def watch(username):
         out = REPO / "output" / refs["b1"].split("/", 1)[1]
         if state == "complete":
             output_to(refs["b1"], out, diagnostics_only=True)
+            try:
+                require_b1_bundle_ready(out)
+            except RuntimeError as e:
+                if fail_on_kaggle_error():
+                    raise
+                print(f"B1 complete but not promotable: {e}; watcher exits")
+                return
             folder = prepare_b(work_root, "b2", username, f"sdxl-{runtime}-b2-{model}-{soc}-{real}-{stamp}", refs["b1"], inputs)
             push_kernel(folder)
             print(f"STARTED_B2={username}/sdxl-{runtime}-b2-{model}-{soc}-{real}-{stamp}")

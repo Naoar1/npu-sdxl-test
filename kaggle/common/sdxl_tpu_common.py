@@ -72,6 +72,7 @@ def configure_env(model_name, min_soc, realistic, civitai_version_id=None):
 
 def install_tools_and_convert_package():
     print(f"[*] {now_hms()} installing system tools and convertsdxl")
+    run("cat /etc/os-release", check=False)
     run("apt-get update -y > /dev/null")
     run("apt-get install -y unzip zip curl time ca-certificates > /dev/null")
     run(
@@ -94,6 +95,7 @@ install_first libunwind libunwind-19 libunwind-18 libunwind-17 libunwind-16 libu
 """
     )
     run("ldconfig")
+    ensure_qnn_host_runtime_libs()
     run("curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1")
     os.environ["PATH"] = f"/root/.local/bin:{os.environ['PATH']}"
     run("rm -rf /tmp/convertsdxl.zip /tmp/convertsdxl_unzip")
@@ -111,6 +113,31 @@ install_first libunwind libunwind-19 libunwind-18 libunwind-17 libunwind-16 libu
     assert root, "export_sdxl.sh not found in convertsdxl.zip"
     os.environ["NPUCONVERT_DIR"] = os.path.abspath(root)
     print(f"[*] {now_hms()} NPUCONVERT_DIR={os.environ['NPUCONVERT_DIR']}")
+
+
+def ensure_qnn_host_runtime_libs():
+    required = ["libc++.so.1", "libc++abi.so.1", "libunwind.so.1"]
+    out = subprocess.check_output(["bash", "-lc", "ldconfig -p || true"], text=True)
+    missing = [name for name in required if name not in out]
+    if missing:
+        dirs = []
+        for name in missing:
+            hits = subprocess.check_output(
+                ["bash", "-lc", f"find /usr /lib -name '{name}' -print 2>/dev/null | head -20"],
+                text=True,
+            ).splitlines()
+            print(f"[*] {now_hms()} {name} candidates={hits[:5]}")
+            dirs.extend(os.path.dirname(p) for p in hits if os.path.exists(p))
+        if dirs:
+            with open("/etc/ld.so.conf.d/qnn-runtime.conf", "w") as f:
+                f.write("\n".join(sorted(set(dirs))) + "\n")
+            run("ldconfig")
+            out = subprocess.check_output(["bash", "-lc", "ldconfig -p || true"], text=True)
+            missing = [name for name in required if name not in out]
+    if missing:
+        run("find /usr /lib -name 'libc++.so*' -o -name 'libc++abi.so*' -o -name 'libunwind.so*' | sort | head -120", check=False)
+        raise RuntimeError("required QNN host runtime libraries missing: " + ", ".join(missing))
+    print(f"[*] {now_hms()} QNN host runtime libraries present: {', '.join(required)}")
 
 
 def install_qnn_sdk():
@@ -132,6 +159,14 @@ def install_qnn_sdk():
     os.environ["QNN_SDK_BIN"] = os.path.dirname(envsetup)
     os.environ["QNN_SDK_ROOT_DIR"] = os.path.dirname(os.environ["QNN_SDK_BIN"])
     print(f"[*] {now_hms()} QNN_SDK_ROOT={os.environ['QNN_SDK_ROOT_DIR']}")
+    for rel in [
+        "lib/x86_64-linux-clang/libPyIrGraph.so",
+        "lib/x86_64-linux-clang/libQnnHtp.so",
+        "lib/x86_64-linux-clang/libQnnModelDlc.so",
+    ]:
+        lib = os.path.join(os.environ["QNN_SDK_ROOT_DIR"], rel)
+        if os.path.exists(lib):
+            run(f"ldd {lib} | egrep 'not found|libc\\+\\+|libunwind|libpython' || true", check=False)
 
 
 def setup_python_env():
@@ -960,7 +995,7 @@ def create_b1_bundle():
     assert os.path.isdir(output_dir), f"{output_dir} missing"
     shutil.copytree(output_dir, f"{bundle}/output/qnn_models_sdxl_{soc}")
     for rel in [
-        "unet_sdxl/model.onnx",
+        "unet_sdxl",
         "input_list_unet_sdxl.txt",
         f"htp_backend_{soc}.json",
         f"htp_config_{soc}.json",
@@ -968,8 +1003,22 @@ def create_b1_bundle():
     ]:
         src = f"{npu}/{rel}"
         assert os.path.exists(src), f"required B1 bundle file missing: {src}"
-        os.makedirs(os.path.dirname(f"{bundle}/{rel}"), exist_ok=True)
-        shutil.copy2(src, f"{bundle}/{rel}")
+        dst = f"{bundle}/{rel}"
+        if os.path.isdir(src):
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+        else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+    onnx_sidecars = sorted(
+        os.path.relpath(p, npu)
+        for p in glob.glob(f"{npu}/unet_sdxl/**", recursive=True)
+        if os.path.isfile(p)
+    )
+    assert any(p == "unet_sdxl/model.onnx" for p in onnx_sidecars), "unet_sdxl/model.onnx missing"
+    if len(onnx_sidecars) < 2:
+        print(f"[*] {now_hms()} warning: unet_sdxl has no ONNX sidecar files")
     rows, deps, missing = referenced_input_files(f"{npu}/input_list_unet_sdxl.txt", npu)
     dep_bytes = 0
     dep_rels = []
@@ -982,6 +1031,7 @@ def create_b1_bundle():
         "model_name": os.environ["MODEL_NAME"],
         "min_soc": soc,
         "input_list_rows": rows,
+        "unet_sdxl_files": onnx_sidecars[:200],
         "dependency_count": len(dep_rels),
         "dependency_mib": round(dep_bytes / (1024 * 1024), 1),
         "dependencies": dep_rels[:2000],

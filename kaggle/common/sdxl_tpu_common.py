@@ -73,7 +73,26 @@ def configure_env(model_name, min_soc, realistic, civitai_version_id=None):
 def install_tools_and_convert_package():
     print(f"[*] {now_hms()} installing system tools and convertsdxl")
     run("apt-get update -y > /dev/null")
-    run("apt-get install -y unzip zip curl time libc++1-19 libc++abi1-19 libunwind-19 > /dev/null")
+    run("apt-get install -y unzip zip curl time ca-certificates > /dev/null")
+    run(
+        r"""
+install_first() {
+  label="$1"; shift
+  for pkg in "$@"; do
+    if apt-get install -y "$pkg" >/tmp/apt_${label}.log 2>&1; then
+      echo "[*] installed $pkg for $label"
+      return 0
+    fi
+  done
+  echo "[*] warning: no apt package installed for $label; tried: $*"
+  tail -20 "/tmp/apt_${label}.log" 2>/dev/null || true
+  return 0
+}
+install_first libcxx libc++1-19 libc++1-18 libc++1-17 libc++1-16 libc++1-15 libc++1-14 libc++1
+install_first libcxxabi libc++abi1-19 libc++abi1-18 libc++abi1-17 libc++abi1-16 libc++abi1-15 libc++abi1-14 libc++abi1
+install_first libunwind libunwind-19 libunwind-18 libunwind-17 libunwind-16 libunwind-15 libunwind-14 libunwind8 libunwind-dev
+"""
+    )
     run("ldconfig")
     run("curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1")
     os.environ["PATH"] = f"/root/.local/bin:{os.environ['PATH']}"

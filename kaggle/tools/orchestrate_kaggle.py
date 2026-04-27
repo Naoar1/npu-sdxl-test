@@ -223,6 +223,18 @@ def output_to(ref, target, diagnostics_only=False):
         return
 
 
+def fail_on_kaggle_error():
+    return os.environ.get("FAIL_ON_KAGGLE_ERROR", "true").lower() == "true"
+
+
+def handle_kaggle_error(stage, ref, state, out):
+    output_to(ref, out)
+    msg = f"{stage} failed state={state}"
+    if fail_on_kaggle_error():
+        raise SystemExit(msg)
+    print(f"{msg}; FAIL_ON_KAGGLE_ERROR=false so watcher exits without failing")
+
+
 def print_tree(root):
     for p in sorted(root.rglob("*")):
         if p.is_file():
@@ -288,8 +300,7 @@ def watch(username):
             output_to(refs["b2"], out)
             print(f"B2_COMPLETE={refs['b2']}")
         elif state in {"error", "cancel_acknowledged", "cancel_requested"}:
-            output_to(refs["b2"], out)
-            raise SystemExit(f"B2 failed state={state}")
+            handle_kaggle_error("B2", refs["b2"], state, out)
         else:
             output_to(refs["b2"], out, diagnostics_only=True)
             print(f"B2 still {state}; watcher exits")
@@ -304,8 +315,7 @@ def watch(username):
             push_kernel(folder)
             print(f"STARTED_B2={username}/sdxl-{runtime}-b2-{model}-{soc}-{real}-{stamp}")
         elif state in {"error", "cancel_acknowledged", "cancel_requested"}:
-            output_to(refs["b1"], out)
-            raise SystemExit(f"B1 failed state={state}")
+            handle_kaggle_error("B1", refs["b1"], state, out)
         else:
             output_to(refs["b1"], out, diagnostics_only=True)
             print(f"B1 still {state}; watcher exits")
@@ -319,8 +329,7 @@ def watch(username):
             print(f"STARTED_B1={username}/sdxl-{runtime}-b1-{model}-{soc}-{real}-{stamp}")
         elif state in {"error", "cancel_acknowledged", "cancel_requested"}:
             out = REPO / "output" / refs["a"].split("/", 1)[1]
-            output_to(refs["a"], out)
-            raise SystemExit(f"A failed state={state}")
+            handle_kaggle_error("A", refs["a"], state, out)
         else:
             print(f"A still {state}; watcher exits")
         return

@@ -97,6 +97,7 @@ jobs:
           RUNTIME_MODE: ${{ inputs.runtime_mode || vars.SDXL_RUNTIME_MODE || 'cpu' }}
           SKIP_PHASE1: ${{ inputs.skip_phase1 || vars.SDXL_SKIP_PHASE1 || 'false' }}
           PHASE1_SLUG: ${{ inputs.phase1_slug || vars.SDXL_PHASE1_SLUG || '' }}
+          FAIL_ON_KAGGLE_ERROR: ${{ github.event_name == 'schedule' && 'false' || vars.SDXL_FAIL_ON_KAGGLE_ERROR || 'true' }}
           CIVITAI_API_KEY: ${{ secrets.CIVITAI_API_KEY }}
         run: |
           python kaggle/tools/orchestrate_kaggle.py
